@@ -2,6 +2,16 @@ import { Router, type Request, type Response } from 'express';
 import { agentFloatService } from '../services/agentFloatService.js';
 import { requireJwtAuth } from '../middleware/jwtAuth.js';
 import { requireRole } from '../middleware/rbac.js';
+import { validateBody, validateParams, validateQuery } from '../middleware/validation.js';
+import {
+  emptyAgentBodySchema,
+  emptyAgentParamsSchema,
+  emptyAgentQuerySchema,
+  floatTransferIdParamsSchema,
+  initiateFloatTransferBodySchema,
+  pairLimitsQuerySchema,
+  setPairLimitsBodySchema,
+} from '../schemas/agentSchemas.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { AppError } from '../errors/AppError.js';
 
@@ -13,6 +23,9 @@ const router = Router();
 router.post(
   '/float-transfer',
   requireJwtAuth,
+  validateParams(emptyAgentParamsSchema),
+  validateQuery(emptyAgentQuerySchema),
+  validateBody(initiateFloatTransferBodySchema),
   asyncHandler(async (req: Request, res: Response) => {
     const { fromAgent, toAgent, amount, reason } = req.body;
     const publicKey = (req as { user?: { publicKey?: string } }).user?.publicKey;
@@ -21,7 +34,7 @@ router.post(
     const result = await agentFloatService.initiateTransfer({
       fromAgent,
       toAgent,
-      amount: Number(amount),
+      amount,
       reason,
       createdBy: publicKey!,
       userRole: role,
@@ -37,6 +50,9 @@ router.post(
 router.post(
   '/float-transfer/:id/approve',
   requireJwtAuth,
+  validateParams(floatTransferIdParamsSchema),
+  validateQuery(emptyAgentQuerySchema),
+  validateBody(emptyAgentBodySchema),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.id as string;
     const publicKey = (req as { user?: { publicKey?: string } }).user?.publicKey;
@@ -58,6 +74,9 @@ router.post(
 router.post(
   '/float-transfer/:id/reject',
   requireJwtAuth,
+  validateParams(floatTransferIdParamsSchema),
+  validateQuery(emptyAgentQuerySchema),
+  validateBody(emptyAgentBodySchema),
   asyncHandler(async (req: Request, res: Response) => {
     const id = req.params.id as string;
     const publicKey = (req as { user?: { publicKey?: string } }).user?.publicKey;
@@ -79,6 +98,9 @@ router.post(
 router.get(
   '/float-transfer/limits',
   requireJwtAuth,
+  validateParams(emptyAgentParamsSchema),
+  validateQuery(pairLimitsQuerySchema),
+  validateBody(emptyAgentBodySchema),
   asyncHandler(async (req: Request, res: Response) => {
     const fromAgent = req.query.fromAgent as string;
     const toAgent = req.query.toAgent as string;
@@ -102,6 +124,9 @@ router.put(
   '/float-transfer/limits',
   requireJwtAuth,
   requireRole('admin'),
+  validateParams(emptyAgentParamsSchema),
+  validateQuery(emptyAgentQuerySchema),
+  validateBody(setPairLimitsBodySchema),
   asyncHandler(async (req: Request, res: Response) => {
     const { fromAgent, toAgent, dailyLimit, weeklyLimit } = req.body;
     const publicKey = (req as { user?: { publicKey?: string } }).user?.publicKey;
@@ -109,8 +134,8 @@ router.put(
     const result = await agentFloatService.setPairLimits({
       fromAgent,
       toAgent,
-      dailyLimit: Number(dailyLimit),
-      weeklyLimit: Number(weeklyLimit),
+      dailyLimit,
+      weeklyLimit,
       updatedBy: publicKey!,
     });
 
