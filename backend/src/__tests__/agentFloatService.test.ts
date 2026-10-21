@@ -372,6 +372,14 @@ describe('AgentFloatService', () => {
       expect(result.unsignedTxXdr).toBe('AAAA...XDR');
       expect(mockBuildTransferToAgentTx).toHaveBeenCalledWith(AGENT_A, AGENT_B, 100_000_000_000n);
       expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining("SET status = 'AWAITING_SIGNATURE'"),
+        ['ft_123'],
+      );
+      expect(mockQuery).not.toHaveBeenCalledWith(
+        expect.stringContaining("'COMPLETED'"),
+        expect.anything(),
+      );
+      expect(mockQuery).toHaveBeenCalledWith(
         expect.stringContaining('INSERT INTO audit_logs'),
         expect.arrayContaining([
           AGENT_B,
@@ -506,7 +514,9 @@ describe('AgentFloatService', () => {
           },
         ],
       });
-      mockQuery.mockResolvedValueOnce({ rows: [] });
+      mockQuery.mockResolvedValueOnce({ rows: [] }); // check existing
+      mockQuery.mockResolvedValueOnce({ rows: [] }); // insert approval (rolled back)
+      mockQuery.mockResolvedValueOnce({ rows: [{ approval_count: 2 }] }); // UPDATE approval_count
 
       await expect(
         service.approveTransfer({
@@ -515,7 +525,17 @@ describe('AgentFloatService', () => {
         }),
       ).rejects.toThrow('AGENT_VAULT_CONTRACT_ID is not configured');
 
-      expect(mockQuery).toHaveBeenCalledTimes(2);
+      // Thrown inside the transaction before the claim, so the approval
+      // insert and count increment roll back and nothing is audited.
+      expect(mockQuery).toHaveBeenCalledTimes(4);
+      expect(mockQuery).not.toHaveBeenCalledWith(
+        expect.stringContaining('AWAITING_SIGNATURE'),
+        expect.anything(),
+      );
+      expect(mockQuery).not.toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO audit_logs'),
+        expect.anything(),
+      );
       expect(mockBuildTransferToAgentTx).not.toHaveBeenCalled();
     });
 

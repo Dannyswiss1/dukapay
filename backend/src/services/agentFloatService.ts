@@ -352,17 +352,23 @@ export class AgentFloatService {
       );
       const newCount = (countRes.rows[0] as { approval_count: number }).approval_count;
 
-      // Claim the right to execute on-chain atomically, still holding the
-      // row lock: only the approval that reaches the threshold flips status
-      // away from PENDING_APPROVAL, with a WHERE guard so a second approval
-      // racing to the same threshold (e.g. a third approver, or a retried
-      // request arriving before the post-lock status update below lands)
-      // cannot also claim it and double-execute the transfer (#791).
+      // Claim the threshold atomically, still holding the row lock: only the
+      // approval that reaches it flips status away from PENDING_APPROVAL,
+      // with a WHERE guard so a second approval racing to the same threshold
+      // (e.g. a third approver, or a retried request arriving before the
+      // post-lock status update below lands) cannot also claim it (#791).
+      // The transfer only awaits signatures here; COMPLETED is set by
+      // submitTransfer once Stellar confirms it (#792).
       let claimedExecution = false;
       if (newCount >= transfer.required_approvals) {
+        // Fail closed before anything is recorded: throwing here rolls back
+        // the approval insert and the count increment.
+        if (!env.AGENT_VAULT_CONTRACT_ID?.trim()) {
+          throw AppError.internal('AGENT_VAULT_CONTRACT_ID is not configured');
+        }
         const claim = await client.query(
           `UPDATE agent_float_transfers
-           SET status = 'COMPLETED'
+           SET status = 'AWAITING_SIGNATURE'
            WHERE id = $1 AND status = 'PENDING_APPROVAL'
            RETURNING id`,
           [transferId],
@@ -387,23 +393,20 @@ export class AgentFloatService {
     const executedOnChain = false as const;
 
     if (claimedExecution) {
-      // We atomically claimed the execution right inside the locked
-      // transaction above (status is already COMPLETED there), so no
-      // concurrent approval can also reach this branch for the same
-      // transfer (#791). Execute on-chain and correct status to FAILED if
-      // it errors; approval_count was already incremented atomically above.
-      let onChainError: string | null = null;
+      // We atomically claimed the threshold inside the locked transaction
+      // above (status is already AWAITING_SIGNATURE there), so no concurrent
+      // approval can also reach this branch for the same transfer (#791).
+      // Build the transaction for both agents to authorize; building does
+      // not execute it. Correct status to FAILED if the build errors.
+      let buildError: string | null = null;
       try {
-        if (env.AGENT_VAULT_CONTRACT_ID) {
-          const result = await sorobanService.buildTransferToAgentTx(
-            transfer.from_agent,
-            transfer.to_agent,
-            // Stored in whole tokens; the contract takes stroops.
-            toStroops(String(transfer.amount)),
-          );
-          unsignedTxXdr = result.unsignedTxXdr;
-        }
-        executedOnChain = true;
+        const result = await sorobanService.buildTransferToAgentTx(
+          transfer.from_agent,
+          transfer.to_agent,
+          // Stored in whole tokens; the contract takes stroops.
+          toStroops(String(transfer.amount)),
+        );
+        unsignedTxXdr = result.unsignedTxXdr;
       } catch (err) {
         buildError = err instanceof Error ? err.message : String(err);
         logger.error('Failed to build Soroban float transfer transaction', {
@@ -420,7 +423,7 @@ export class AgentFloatService {
          SET status = COALESCE($2, status), updated_at = NOW(), error_message = $3
          WHERE id = $1
          RETURNING *`,
-        [transferId, onChainError ? 'FAILED' : null, onChainError],
+        [transferId, buildError ? 'FAILED' : null, buildError],
       );
       updatedTransfer = updateRes.rows[0] as AgentFloatTransferRow;
 
@@ -494,7 +497,7 @@ export class AgentFloatService {
         'Only the initiating agent, recipient agent, or an admin can submit this transfer.',
       );
     }
-    if (!process.env.AGENT_VAULT_CONTRACT_ID?.trim()) {
+    if (!env.AGENT_VAULT_CONTRACT_ID?.trim()) {
       throw AppError.internal('AGENT_VAULT_CONTRACT_ID is not configured');
     }
 
