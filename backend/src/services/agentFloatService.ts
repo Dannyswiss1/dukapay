@@ -4,6 +4,7 @@ import { AppError } from '../errors/AppError.js';
 import logger from '../utils/logger.js';
 import { sorobanService } from './sorobanService.js';
 import { toStroops } from '../money/decimal.js';
+import { env } from '../config/env.js';
 
 export interface InitiateTransferInput {
   fromAgent: string;
@@ -380,7 +381,7 @@ export class AgentFloatService {
       // it errors; approval_count was already incremented atomically above.
       let onChainError: string | null = null;
       try {
-        if (process.env.AGENT_VAULT_CONTRACT_ID) {
+        if (env.AGENT_VAULT_CONTRACT_ID) {
           const result = await sorobanService.buildTransferToAgentTx(
             transfer.from_agent,
             transfer.to_agent,
