@@ -13,6 +13,8 @@ const mockQuery: jest.MockedFunction<
 > = jest.fn();
 
 const mockBuildTransferToAgentTx = jest.fn();
+const mockValidateTransferToAgentTx = jest.fn();
+const mockSubmitSignedTx = jest.fn();
 
 jest.unstable_mockModule('../db/connection.js', () => ({
   default: { query: mockQuery },
@@ -22,17 +24,20 @@ jest.unstable_mockModule('../db/connection.js', () => ({
 jest.unstable_mockModule('../services/sorobanService.js', () => ({
   sorobanService: {
     buildTransferToAgentTx: mockBuildTransferToAgentTx,
+    validateTransferToAgentTx: mockValidateTransferToAgentTx,
+    submitSignedTx: mockSubmitSignedTx,
   },
 }));
 
 await import('../db/connection.js');
-const { AgentFloatService, agentFloatService } = await import('../services/agentFloatService.js');
+const { AgentFloatService } = await import('../services/agentFloatService.js');
 
 describe('AgentFloatService', () => {
   let service: AgentFloatService;
 
   beforeEach(() => {
     jest.clearAllMocks();
+    delete process.env.AGENT_VAULT_CONTRACT_ID;
     service = new AgentFloatService();
   });
 
@@ -300,7 +305,7 @@ describe('AgentFloatService', () => {
   });
 
   describe('approveTransfer (2-of-3 Multisig & Soroban Integration)', () => {
-    it('executes second approval, completes transfer, and triggers Soroban call when configured', async () => {
+    it('moves to awaiting signature without claiming on-chain execution at the threshold', async () => {
       process.env.AGENT_VAULT_CONTRACT_ID = 'C123456789AGENTVAULT';
       mockBuildTransferToAgentTx.mockResolvedValueOnce({ unsignedTxXdr: 'AAAA...XDR' });
 
@@ -325,7 +330,7 @@ describe('AgentFloatService', () => {
       mockQuery.mockResolvedValueOnce({ rows: [] });
       // INSERT audit_log for approval
       mockQuery.mockResolvedValueOnce({ rows: [] });
-      // UPDATE transfer to COMPLETED
+      // UPDATE transfer to AWAITING_SIGNATURE
       mockQuery.mockResolvedValueOnce({
         rows: [
           {
@@ -333,13 +338,13 @@ describe('AgentFloatService', () => {
             from_agent: AGENT_A,
             to_agent: AGENT_B,
             amount: '10000',
-            status: 'COMPLETED',
+            status: 'AWAITING_SIGNATURE',
             required_approvals: 2,
             approval_count: 2,
           },
         ],
       });
-      // INSERT audit_log for execution
+      // INSERT audit_log for awaiting signature
       mockQuery.mockResolvedValueOnce({ rows: [] });
       // SELECT all approvals
       mockQuery.mockResolvedValueOnce({
@@ -354,15 +359,22 @@ describe('AgentFloatService', () => {
         approver: AGENT_B,
       });
 
-      expect(result.transfer.status).toBe('COMPLETED');
-      expect(result.executedOnChain).toBe(true);
+      expect(result.transfer.status).toBe('AWAITING_SIGNATURE');
+      expect(result.executedOnChain).toBe(false);
       expect(result.unsignedTxXdr).toBe('AAAA...XDR');
       expect(mockBuildTransferToAgentTx).toHaveBeenCalledWith(AGENT_A, AGENT_B, 100_000_000_000n);
-
-      delete process.env.AGENT_VAULT_CONTRACT_ID;
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO audit_logs'),
+        expect.arrayContaining([
+          AGENT_B,
+          'AGENT_FLOAT_TRANSFER_AWAITING_SIGNATURE',
+          expect.any(String),
+          expect.stringContaining('"executedOnChain":false'),
+        ]),
+      );
     });
 
-    it('handles Soroban service error gracefully without failing DB transfer completion', async () => {
+    it('marks the transfer failed when the unsigned transaction cannot be built', async () => {
       process.env.AGENT_VAULT_CONTRACT_ID = 'C123456789AGENTVAULT';
       mockBuildTransferToAgentTx.mockRejectedValueOnce(new Error('Soroban node offline'));
 
@@ -384,9 +396,9 @@ describe('AgentFloatService', () => {
       mockQuery.mockResolvedValueOnce({ rows: [] }); // insert approval
       mockQuery.mockResolvedValueOnce({ rows: [] }); // audit approval
       mockQuery.mockResolvedValueOnce({
-        rows: [{ id: 'ft_124', status: 'COMPLETED', approval_count: 2 }],
-      }); // update COMPLETED
-      mockQuery.mockResolvedValueOnce({ rows: [] }); // audit execution
+        rows: [{ id: 'ft_124', status: 'FAILED', approval_count: 2 }],
+      }); // update FAILED
+      mockQuery.mockResolvedValueOnce({ rows: [] }); // audit build failure
       mockQuery.mockResolvedValueOnce({ rows: [] }); // fetch approvals
 
       const result = await service.approveTransfer({
@@ -394,11 +406,9 @@ describe('AgentFloatService', () => {
         approver: AGENT_B,
       });
 
-      expect(result.transfer.status).toBe('COMPLETED');
+      expect(result.transfer.status).toBe('FAILED');
       expect(result.executedOnChain).toBe(false);
       expect(result.unsignedTxXdr).toBeUndefined();
-
-      delete process.env.AGENT_VAULT_CONTRACT_ID;
     });
 
     it('updates approval count without completing when required approvals threshold is not yet met', async () => {
@@ -435,6 +445,8 @@ describe('AgentFloatService', () => {
     });
 
     it('allows admin role to approve transfer when approver is neither initiator nor recipient', async () => {
+      process.env.AGENT_VAULT_CONTRACT_ID = 'C123456789AGENTVAULT';
+      mockBuildTransferToAgentTx.mockResolvedValueOnce({ unsignedTxXdr: 'AAAA...XDR' });
       mockQuery.mockResolvedValueOnce({
         rows: [
           {
@@ -452,7 +464,7 @@ describe('AgentFloatService', () => {
       mockQuery.mockResolvedValueOnce({ rows: [] });
       mockQuery.mockResolvedValueOnce({ rows: [] });
       mockQuery.mockResolvedValueOnce({
-        rows: [{ id: 'ft_126', status: 'COMPLETED', approval_count: 2 }],
+        rows: [{ id: 'ft_126', status: 'AWAITING_SIGNATURE', approval_count: 2 }],
       });
       mockQuery.mockResolvedValueOnce({ rows: [] });
       mockQuery.mockResolvedValueOnce({ rows: [] });
@@ -463,7 +475,34 @@ describe('AgentFloatService', () => {
         userRole: 'admin',
       });
 
-      expect(result.transfer.status).toBe('COMPLETED');
+      expect(result.transfer.status).toBe('AWAITING_SIGNATURE');
+    });
+
+    it('fails closed before recording the threshold approval when the vault is not configured', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 'ft_126_missing_config',
+            from_agent: AGENT_A,
+            to_agent: AGENT_B,
+            amount: '5000',
+            status: 'PENDING_APPROVAL',
+            required_approvals: 2,
+            approval_count: 1,
+          },
+        ],
+      });
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      await expect(
+        service.approveTransfer({
+          transferId: 'ft_126_missing_config',
+          approver: AGENT_B,
+        }),
+      ).rejects.toThrow('AGENT_VAULT_CONTRACT_ID is not configured');
+
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(mockBuildTransferToAgentTx).not.toHaveBeenCalled();
     });
 
     it('throws notFound when transfer ID does not exist', async () => {
@@ -531,6 +570,90 @@ describe('AgentFloatService', () => {
           approver: AGENT_A,
         }),
       ).rejects.toThrow(`Approver '${AGENT_A}' has already approved this transfer.`);
+    });
+  });
+
+  describe('submitTransfer', () => {
+    const awaitingTransfer = {
+      id: 'ft_submit_1',
+      from_agent: AGENT_A,
+      to_agent: AGENT_B,
+      amount: '25.5',
+      status: 'AWAITING_SIGNATURE',
+      required_approvals: 2,
+      approval_count: 2,
+      tx_hash: null,
+    } as const;
+
+    it('completes only after the matching signed transaction is confirmed', async () => {
+      process.env.AGENT_VAULT_CONTRACT_ID = 'C123456789AGENTVAULT';
+      mockQuery.mockResolvedValueOnce({ rows: [awaitingTransfer] });
+      mockSubmitSignedTx.mockResolvedValueOnce({
+        txHash: 'confirmed-hash',
+        status: 'SUCCESS',
+      });
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ ...awaitingTransfer, status: 'COMPLETED', tx_hash: 'confirmed-hash' }],
+      });
+      mockQuery.mockResolvedValueOnce({ rows: [] });
+
+      const result = await service.submitTransfer({
+        transferId: awaitingTransfer.id,
+        signedTxXdr: 'signed-xdr',
+        submitter: AGENT_B,
+      });
+
+      expect(mockValidateTransferToAgentTx).toHaveBeenCalledWith(
+        'signed-xdr',
+        AGENT_A,
+        AGENT_B,
+        255_000_000n,
+      );
+      expect(mockSubmitSignedTx).toHaveBeenCalledWith('signed-xdr');
+      expect(result.transfer.status).toBe('COMPLETED');
+      expect(result.executedOnChain).toBe(true);
+      expect(result.txHash).toBe('confirmed-hash');
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO audit_logs'),
+        expect.arrayContaining([
+          AGENT_B,
+          'AGENT_FLOAT_TRANSFER_EXECUTED',
+          expect.any(String),
+          expect.stringContaining('"executedOnChain":true'),
+        ]),
+      );
+    });
+
+    it('does not complete when Stellar does not confirm the transaction', async () => {
+      process.env.AGENT_VAULT_CONTRACT_ID = 'C123456789AGENTVAULT';
+      mockQuery.mockResolvedValueOnce({ rows: [awaitingTransfer] });
+      mockSubmitSignedTx.mockRejectedValueOnce(new Error('Transaction failed'));
+
+      await expect(
+        service.submitTransfer({
+          transferId: awaitingTransfer.id,
+          signedTxXdr: 'signed-xdr',
+          submitter: AGENT_A,
+        }),
+      ).rejects.toThrow('Transaction failed');
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a submitter who is not a participant or admin', async () => {
+      process.env.AGENT_VAULT_CONTRACT_ID = 'C123456789AGENTVAULT';
+      mockQuery.mockResolvedValueOnce({ rows: [awaitingTransfer] });
+
+      await expect(
+        service.submitTransfer({
+          transferId: awaitingTransfer.id,
+          signedTxXdr: 'signed-xdr',
+          submitter: THIRD_PARTY,
+        }),
+      ).rejects.toThrow(/Only the initiating agent, recipient agent, or an admin/);
+
+      expect(mockValidateTransferToAgentTx).not.toHaveBeenCalled();
+      expect(mockSubmitSignedTx).not.toHaveBeenCalled();
     });
   });
 

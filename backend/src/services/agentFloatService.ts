@@ -20,6 +20,13 @@ export interface ApproveTransferInput {
   userRole?: string | undefined;
 }
 
+export interface SubmitTransferInput {
+  transferId: string;
+  signedTxXdr: string;
+  submitter: string;
+  userRole?: string | undefined;
+}
+
 export interface RejectTransferInput {
   transferId: string;
   rejector: string;
@@ -40,7 +47,13 @@ export interface AgentFloatTransferRow {
   to_agent: string;
   amount: string;
   reason: string | null;
-  status: 'PENDING_APPROVAL' | 'COMPLETED' | 'REJECTED' | 'CANCELLED';
+  status:
+    | 'PENDING_APPROVAL'
+    | 'AWAITING_SIGNATURE'
+    | 'COMPLETED'
+    | 'REJECTED'
+    | 'CANCELLED'
+    | 'FAILED';
   required_approvals: number;
   approval_count: number;
   created_by: string;
@@ -150,7 +163,7 @@ export class AgentFloatService {
     const dailyRes = await query(
       `SELECT COALESCE(SUM(amount), 0) as total FROM agent_float_transfers
        WHERE from_agent = $1 AND to_agent = $2
-         AND status IN ('PENDING_APPROVAL', 'COMPLETED')
+         AND status IN ('PENDING_APPROVAL', 'AWAITING_SIGNATURE', 'COMPLETED')
          AND created_at >= NOW() - INTERVAL '24 hours'`,
       [fromAgent, toAgent],
     );
@@ -166,7 +179,7 @@ export class AgentFloatService {
     const weeklyRes = await query(
       `SELECT COALESCE(SUM(amount), 0) as total FROM agent_float_transfers
        WHERE from_agent = $1 AND to_agent = $2
-         AND status IN ('PENDING_APPROVAL', 'COMPLETED')
+         AND status IN ('PENDING_APPROVAL', 'AWAITING_SIGNATURE', 'COMPLETED')
          AND created_at >= NOW() - INTERVAL '7 days'`,
       [fromAgent, toAgent],
     );
@@ -248,7 +261,7 @@ export class AgentFloatService {
   async approveTransfer(input: ApproveTransferInput): Promise<{
     transfer: AgentFloatTransferRow;
     approvals: TransferApprovalRow[];
-    executedOnChain?: boolean;
+    executedOnChain: false;
     unsignedTxXdr?: string;
   }> {
     const { transferId, approver, userRole } = input;
@@ -289,14 +302,17 @@ export class AgentFloatService {
       throw AppError.badRequest(`Approver '${approver}' has already approved this transfer.`);
     }
 
+    const newCount = transfer.approval_count + 1;
+    if (newCount >= transfer.required_approvals && !process.env.AGENT_VAULT_CONTRACT_ID?.trim()) {
+      throw AppError.internal('AGENT_VAULT_CONTRACT_ID is not configured');
+    }
+
     // Insert approval
     await query(
       `INSERT INTO agent_float_transfer_approvals (transfer_id, approver, role)
        VALUES ($1, $2, $3)`,
       [transferId, approver, role],
     );
-
-    const newCount = transfer.approval_count + 1;
 
     // Log approval audit entry
     await this.logAudit({
@@ -309,26 +325,24 @@ export class AgentFloatService {
 
     let updatedTransfer = transfer;
     let unsignedTxXdr: string | undefined;
-    let executedOnChain = false;
+    const executedOnChain = false as const;
 
     // Threshold check (2-of-3)
     if (newCount >= transfer.required_approvals) {
-      // Execute the float transfer on Soroban contract if configured
-      let onChainError: string | null = null;
+      // Build the transaction for both agents to authorize. Building an XDR
+      // does not execute the transfer; completion happens only after submit.
+      let buildError: string | null = null;
       try {
-        if (process.env.AGENT_VAULT_CONTRACT_ID) {
-          const result = await sorobanService.buildTransferToAgentTx(
-            transfer.from_agent,
-            transfer.to_agent,
-            // Stored in whole tokens; the contract takes stroops.
-            toStroops(String(transfer.amount)),
-          );
-          unsignedTxXdr = result.unsignedTxXdr;
-        }
-        executedOnChain = true;
+        const result = await sorobanService.buildTransferToAgentTx(
+          transfer.from_agent,
+          transfer.to_agent,
+          // Stored in whole tokens; the contract takes stroops.
+          toStroops(String(transfer.amount)),
+        );
+        unsignedTxXdr = result.unsignedTxXdr;
       } catch (err) {
-        onChainError = err instanceof Error ? err.message : String(err);
-        logger.error('Soroban contract execution failed', {
+        buildError = err instanceof Error ? err.message : String(err);
+        logger.error('Failed to build Soroban float transfer transaction', {
           err,
           transferId,
           fromAgent: transfer.from_agent,
@@ -337,30 +351,30 @@ export class AgentFloatService {
         });
       }
 
-      // Mark as FAILED if on-chain execution failed, COMPLETED otherwise
-      const transferStatus = onChainError ? 'FAILED' : 'COMPLETED';
+      const transferStatus = buildError ? 'FAILED' : 'AWAITING_SIGNATURE';
       const updateRes = await query(
         `UPDATE agent_float_transfers
-         SET status = $3, approval_count = $2, updated_at = NOW(),
-             error_message = $4
+         SET status = $3, approval_count = $2, updated_at = NOW()
          WHERE id = $1
          RETURNING *`,
-        [transferId, newCount, transferStatus, onChainError],
+        [transferId, newCount, transferStatus],
       );
       updatedTransfer = updateRes.rows[0] as AgentFloatTransferRow;
 
-      // Log execution audit entry
+      // Record the real lifecycle stage: no on-chain execution has happened.
       await this.logAudit({
         actor: approver,
-        action: 'AGENT_FLOAT_TRANSFER_EXECUTED',
+        action: buildError
+          ? 'AGENT_FLOAT_TRANSFER_BUILD_FAILED'
+          : 'AGENT_FLOAT_TRANSFER_AWAITING_SIGNATURE',
         target: `TransferID:${transferId}`,
         payload: {
           fromAgent: transfer.from_agent,
           toAgent: transfer.to_agent,
           amount: transfer.amount,
-          executedOnChain,
+          executedOnChain: false,
         },
-        status: 200,
+        status: buildError ? 500 : 200,
       });
     } else {
       const updateRes = await query(
@@ -383,6 +397,86 @@ export class AgentFloatService {
       approvals: approvalsRes.rows as TransferApprovalRow[],
       executedOnChain,
       ...(unsignedTxXdr ? { unsignedTxXdr } : {}),
+    };
+  }
+
+  /**
+   * Validate and submit a fully authorized float-transfer transaction.
+   * The transfer is completed only after Stellar confirms SUCCESS.
+   */
+  async submitTransfer(input: SubmitTransferInput): Promise<{
+    transfer: AgentFloatTransferRow;
+    executedOnChain: true;
+    txHash: string;
+  }> {
+    const { transferId, signedTxXdr, submitter, userRole } = input;
+
+    const transferRes = await query(`SELECT * FROM agent_float_transfers WHERE id = $1`, [
+      transferId,
+    ]);
+    if (transferRes.rows.length === 0) {
+      throw AppError.notFound(`Float transfer request '${transferId}' not found.`);
+    }
+
+    const transfer = transferRes.rows[0] as AgentFloatTransferRow;
+    if (transfer.status !== 'AWAITING_SIGNATURE') {
+      throw AppError.badRequest(`Transfer is already in status '${transfer.status}'.`);
+    }
+
+    const isParticipant = submitter === transfer.from_agent || submitter === transfer.to_agent;
+    const isAdmin = userRole === 'admin' || userRole === 'super_admin';
+    if (!isParticipant && !isAdmin) {
+      throw AppError.forbidden(
+        'Only the initiating agent, recipient agent, or an admin can submit this transfer.',
+      );
+    }
+    if (!process.env.AGENT_VAULT_CONTRACT_ID?.trim()) {
+      throw AppError.internal('AGENT_VAULT_CONTRACT_ID is not configured');
+    }
+
+    const amount = toStroops(String(transfer.amount));
+    sorobanService.validateTransferToAgentTx(
+      signedTxXdr,
+      transfer.from_agent,
+      transfer.to_agent,
+      amount,
+    );
+
+    const stellarResult = await sorobanService.submitSignedTx(signedTxXdr);
+    if (stellarResult.status !== 'SUCCESS') {
+      throw AppError.internal('Float transfer was not confirmed on the Stellar network');
+    }
+
+    const updateRes = await query(
+      `UPDATE agent_float_transfers
+       SET status = 'COMPLETED', tx_hash = $2, updated_at = NOW()
+       WHERE id = $1 AND status = 'AWAITING_SIGNATURE'
+       RETURNING *`,
+      [transferId, stellarResult.txHash],
+    );
+    if (updateRes.rows.length === 0) {
+      throw AppError.conflict('Float transfer status changed while the transaction was submitted');
+    }
+
+    const updatedTransfer = updateRes.rows[0] as AgentFloatTransferRow;
+    await this.logAudit({
+      actor: submitter,
+      action: 'AGENT_FLOAT_TRANSFER_EXECUTED',
+      target: `TransferID:${transferId}`,
+      payload: {
+        fromAgent: transfer.from_agent,
+        toAgent: transfer.to_agent,
+        amount: transfer.amount,
+        txHash: stellarResult.txHash,
+        executedOnChain: true,
+      },
+      status: 200,
+    });
+
+    return {
+      transfer: updatedTransfer,
+      executedOnChain: true,
+      txHash: stellarResult.txHash,
     };
   }
 
